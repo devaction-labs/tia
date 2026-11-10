@@ -23,7 +23,12 @@ defmodule Tia.Config do
     base: "main",
     global_files: ["mix.exs", "mix.lock", ".tool-versions", "test/test_helper.exs"],
     extra_global_files: [],
-    global_globs: ["config/**/*.exs", "priv/*/migrations/*.exs"],
+    global_globs: [
+      "config/config.exs",
+      "config/test.exs",
+      "config/runtime.exs",
+      "priv/*/migrations/*.exs"
+    ],
     macro_globs: ["lib/**/*.ex", "test/support/**/*.ex"],
     macro_markers: ["defmacro", "using do", "using("],
     test_globs: ["test/**/*_test.exs"]

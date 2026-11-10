@@ -65,6 +65,25 @@ defmodule Tia.MapTest do
     assert {:all, _reason} = Tia.Map.plan(map, Tia.Config.new(root: root))
   end
 
+  test "changing an env config that is not global does not move the globals", %{
+    root: root,
+    map: map
+  } do
+    write(root, "config/dev.exs", "dev")
+    write(root, "config/prod.exs", "prod")
+
+    assert Tia.Map.plan(map, Tia.Config.new(root: root)) == {:run, []}
+  end
+
+  test "changing config/test.exs moves the globals", %{root: root} do
+    write(root, "config/test.exs", "t")
+    config = Tia.Config.new(root: root)
+    map = Tia.Map.new(config)
+    write(root, "config/test.exs", "t2")
+
+    assert {:all, _reason} = Tia.Map.plan(map, config)
+  end
+
   test "a file that defines macros is a global", %{root: root} do
     write(root, "lib/macros.ex", "defmacro x, do: nil")
     map = Tia.Map.new(Tia.Config.new(root: root))

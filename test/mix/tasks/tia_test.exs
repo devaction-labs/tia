@@ -88,6 +88,39 @@ defmodule Mix.Tasks.TiaTest do
     refute output =~ "test/alpha_test.exs"
   end
 
+  test "after_suite callbacks run once, after every test file is recorded", %{root: root} do
+    log = Path.join(root, "after_suite.log")
+
+    write(root, "test/test_helper.exs", """
+    ExUnit.start()
+    ExUnit.after_suite(fn stats -> File.write!(#{inspect(log)}, "total=\#{stats.total}\\n", [:append]) end)
+    """)
+
+    assert {_, 0} = mix(root, ["tia"])
+    assert File.read!(log) == "total=3\n"
+  end
+
+  test "--check falls back to the whole suite when the base cannot be diffed", %{root: root} do
+    {_, 0} = mix(root, ["tia"])
+    init_git(root)
+
+    assert {output, 0} = mix(root, ["tia", "--check", "--dry-run", "--base", "nao-existe"])
+    assert output =~ "whole suite (cannot diff against nao-existe:"
+  end
+
+  test "--check diffs against the merge base, not the tip of an advanced base", %{root: root} do
+    {_, 0} = mix(root, ["tia"])
+    init_git(root)
+    git!(root, ["branch", "base"])
+    git!(root, ["checkout", "-q", "base"])
+    write(root, "lib/alpha.ex", "defmodule Alpha, do: def(value, do: 1 + 0)")
+    git!(root, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "advance"])
+    git!(root, ["checkout", "-q", "-"])
+
+    assert {output, 0} = mix(root, ["tia", "--check", "--dry-run", "--base", "base"])
+    assert output =~ "no test file is affected"
+  end
+
   test "outside the test environment it refuses with the fix", %{root: root} do
     assert {output, status} =
              System.cmd("mix", ["tia"],
@@ -125,6 +158,8 @@ defmodule Mix.Tasks.TiaTest do
       {_, 0} = System.cmd("git", args, cd: root)
     end
   end
+
+  defp git!(root, args), do: {_, 0} = System.cmd("git", args, cd: root, stderr_to_stdout: true)
 
   defp tests(root) do
     {:ok, map} = Tia.Map.read(Path.join(root, ".tia/map.json"))

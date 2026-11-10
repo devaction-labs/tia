@@ -16,7 +16,7 @@ defmodule Mix.Tasks.Tia do
   Recording runs each test file on its own and stores the files it executed. A
   file whose tests fail is not recorded and stays stale, and the task then
   exits with an error. `--check` selects the stale test files plus those whose
-  recorded sources appear in `git diff --name-only BASE`, and runs the whole
+  recorded sources appear in `git diff --name-only $(git merge-base BASE HEAD)`, and runs the whole
   suite when the map is missing or the globals moved.
 
   ## Options
@@ -69,8 +69,12 @@ defmodule Mix.Tasks.Tia do
     Tia.Config.new(Keyword.merge(Mix.Project.config()[:tia] || [], overrides))
   end
 
-  defp check({:ok, map}, config, opts, rest),
-    do: execute(Tia.Map.select(map, changed_files(config.base), config), opts, rest)
+  defp check({:ok, map}, config, opts, rest) do
+    case changed_files(config.base) do
+      {:ok, files} -> execute(Tia.Map.select(map, files, config), opts, rest)
+      {:error, reason} -> execute({:all, reason}, opts, rest)
+    end
+  end
 
   defp check(:error, _config, opts, rest), do: execute({:all, "no map"}, opts, rest)
 
@@ -124,16 +128,28 @@ defmodule Mix.Tasks.Tia do
     Mix.ensure_application!(:ex_unit)
     :ok = Application.ensure_loaded(:ex_unit)
     ExUnit.configure(autorun: false, max_cases: 1)
-    Code.require_file("test/test_helper.exs")
+    Code.require_file(Path.join(config.root, "test/test_helper.exs"))
 
-    {map, failed} =
-      files
-      |> Enum.with_index(1)
-      |> Enum.reduce({map, []}, fn {file, index}, {map, failed} ->
-        {map, failed} = record_file(map, failed, file, modules, config)
-        if rem(index, @save_every) == 0, do: Tia.Map.write(map, config.map)
-        {map, failed}
-      end)
+    # ExUnit.run/0 fires the after_suite callbacks on every run. They are held
+    # back and fired once, with the totals, after all the test files ran.
+    callbacks = Application.get_env(:ex_unit, :after_suite, [])
+    Application.put_env(:ex_unit, :after_suite, [])
+    stats = %{total: 0, failures: 0, excluded: 0, skipped: 0}
+
+    {map, failed, stats} =
+      try do
+        files
+        |> Enum.with_index(1)
+        |> Enum.reduce({map, [], stats}, fn {file, index}, {map, failed, stats} ->
+          {map, failed, stats} = record_file(map, failed, stats, file, modules, config)
+          if rem(index, @save_every) == 0, do: Tia.Map.write(map, config.map)
+          {map, failed, stats}
+        end)
+      after
+        Application.put_env(:ex_unit, :after_suite, callbacks)
+      end
+
+    Enum.each(callbacks, & &1.(stats))
 
     Tia.Map.write(map, config.map)
 
@@ -145,18 +161,24 @@ defmodule Mix.Tasks.Tia do
     report(failed)
   end
 
-  defp record_file(map, failed, file, modules, config) do
+  defp record_file(map, failed, stats, file, modules, config) do
     Tia.Recorder.reset(modules)
     Code.require_file(file)
+    result = ExUnit.run()
+    stats = add_stats(stats, result)
 
-    case ExUnit.run() do
+    case result do
       %{failures: 0} ->
         sources = Tia.Recorder.executed_sources(modules, config.root)
-        {Tia.Map.put(map, config, file, sources), failed}
+        {Tia.Map.put(map, config, file, sources), failed, stats}
 
       %{failures: _} ->
-        {Tia.Map.delete(map, file), [file | failed]}
+        {Tia.Map.delete(map, file), [file | failed], stats}
     end
+  end
+
+  defp add_stats(stats, result) do
+    Map.new(stats, fn {key, sum} -> {key, sum + Map.get(result, key, 0)} end)
   end
 
   defp report([]), do: :ok
@@ -166,13 +188,20 @@ defmodule Mix.Tasks.Tia do
   end
 
   defp changed_files(base) do
-    tracked = git(["diff", "--name-only", base])
-    untracked = git(["ls-files", "--others", "--exclude-standard"])
-    Enum.uniq(tracked ++ untracked)
+    with {:ok, [sha | _]} <- git(["merge-base", base, "HEAD"]),
+         {:ok, tracked} <- git(["diff", "--name-only", sha]),
+         {:ok, untracked} <- git(["ls-files", "--others", "--exclude-standard"]) do
+      {:ok, Enum.uniq(tracked ++ untracked)}
+    else
+      {:error, reason} -> {:error, "cannot diff against #{base}: #{reason}"}
+      {:ok, []} -> {:error, "cannot diff against #{base}: no merge base with HEAD"}
+    end
   end
 
   defp git(args) do
-    {out, 0} = System.cmd("git", args)
-    String.split(out, "\n", trim: true)
+    case System.cmd("git", args, stderr_to_stdout: true) do
+      {out, 0} -> {:ok, String.split(out, "\n", trim: true)}
+      {out, _} -> {:error, out |> String.split("\n", trim: true) |> List.first("git failed")}
+    end
   end
 end

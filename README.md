@@ -44,8 +44,12 @@ A per-test map cannot see everything, so these files share one fingerprint and
 any change to them selects every test file:
 
 - `mix.exs`, `mix.lock`, `.tool-versions`, `test/test_helper.exs`
-- `config/**/*.exs` and `priv/*/migrations/*.exs`
+- `config/config.exs`, `config/test.exs`, `config/runtime.exs` and
+  `priv/*/migrations/*.exs`
 - any file under `lib/` or `test/support/` that defines macros
+
+If your config imports other files (for example `import_config "test/*.exs"`),
+add them to `:global_globs` or `:extra_global_files`.
 
 ## Configuration
 
