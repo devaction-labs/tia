@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - Each test file now records the modules it executed, and its fingerprint includes a digest of their compiled `.beam` files. A change to a macro, a case template or a value inlined at compile time selects only the test files that executed a module compiled with it.
 - The digest is `Tia.Beam.digest/1`, not `:beam_lib.md5/1`: a macro that walks a map (HEEx slots, `@derive Jason.Encoder`, a Commanded router) emits its code in an order that changes between two compilations of the same sources, which left test files stale after any recompilation. The digest hashes the expanded code of the `debug_info` chunk with positions dropped and with function clauses, map keys and list literals sorted, and falls back to the md5 for a module without Elixir debug information. It does not see a compile-time change that only reorders those.

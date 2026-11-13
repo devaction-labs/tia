@@ -12,7 +12,7 @@ sources or modules changed. The map validates itself, so it needs no help from
 
 ```elixir
 def deps do
-  [{:tia, "~> 0.1", only: [:dev, :test], runtime: false}]
+  [{:tia, "~> 0.2", only: [:dev, :test], runtime: false}]
 end
 
 def cli do
