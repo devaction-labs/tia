@@ -36,8 +36,11 @@ defmodule Mix.Tasks.Tia do
   processes that record in parallel and take the test files from one queue:
   each process asks for the next file when it finishes the one it has, so
   none of them waits while there is work left. The queue starts with the
-  test files that have no recorded duration, in order, followed by the others
-  from the slowest to the fastest, by the `ms` the map holds for them.
+  test files that have no known duration, in order, followed by the others
+  from the slowest to the fastest. The durations come from the last
+  recordings on this machine: they are kept in `.tia/durations.bin`, next to
+  the hash cache and out of version control, never in the map. See
+  `Tia.Durations`.
 
   The progress lines count over the whole run and carry the partition, as in
   `[2] tia: [12/749] test/foo_test.exs`. The output of each process is printed
@@ -108,17 +111,19 @@ defmodule Mix.Tasks.Tia do
       work(Keyword.fetch!(opts, :out), config(opts), Keyword.get(opts, :lock))
     else
       Mix.Task.run("compile")
-      coordinate(Tia.Cache.attach(config(opts)), opts, rest)
+      config = config(opts)
+      coordinate(Tia.Cache.attach(config), Tia.Durations.path(config), opts, rest)
     end
   end
 
   # The workers hash only what they record, so the cache is for this side.
-  defp coordinate(config, opts, rest) do
+  # `timings` is the path of the local durations, or `nil` without a cache.
+  defp coordinate(config, timings, opts, rest) do
     stored = Tia.Map.read(config.map)
 
     if Keyword.get(opts, :check, false),
       do: check(stored, config, opts, rest),
-      else: record(stored, config, opts)
+      else: record(stored, config, timings, opts)
   after
     flush_cache(config)
   end
@@ -198,24 +203,40 @@ defmodule Mix.Tasks.Tia do
     unless Keyword.get(opts, :dry_run, false), do: Mix.Task.run("test", rest)
   end
 
-  defp record(stored, config, opts) do
-    stored = loaded_or_new(stored, config)
-    # Read before the plan, which may empty the map.
-    durations = Tia.Map.durations(stored)
-    {map, selection} = recording_plan(stored, config, opts)
+  defp record(stored, config, timings, opts) do
+    {map, selection} = recording_plan(loaded_or_new(stored, config), config, opts)
     flush_cache(config)
 
+    # A current map is left alone: nothing is written when nothing is recorded.
     case {selection, Keyword.get(opts, :dry_run, false)} do
       {{:run, []}, _} -> Mix.shell().info("tia: map is current")
       {{:run, files}, true} -> Mix.shell().info("tia: would record #{length(files)} test files")
-      {{:run, files}, false} -> record_selected(map, files, config, durations)
+      {{:run, files}, false} -> record_selected(map, files, config, timings)
     end
   end
 
-  defp record_selected(map, files, config, durations) do
-    case min(config.partitions, length(files)) do
-      1 -> record_here(map, files, config)
-      workers -> record_partitioned(map, slowest_first(files, durations), config, workers)
+  defp record_selected(map, files, config, timings) do
+    known = Tia.Durations.read(timings)
+
+    {map, failed, taken, suffix} =
+      case min(config.partitions, length(files)) do
+        1 -> record_here(map, files, config)
+        workers -> record_partitioned(map, slowest_first(files, known), config, workers)
+      end
+
+    Tia.Map.write(map, config.map)
+    save_durations(timings, known, taken, config)
+    summary(files, failed, config, suffix)
+  end
+
+  # The durations of the test files recorded now replace the ones known for
+  # them, and the ones of test files that left the disk are dropped.
+  defp save_durations(timings, known, taken, config) do
+    durations = known |> Map.merge(taken) |> Map.take(Tia.Map.test_files(config))
+
+    case Tia.Durations.write(timings, durations) do
+      :ok -> :ok
+      {:error, reason} -> Mix.shell().error("tia: cannot write the durations: #{reason}")
     end
   end
 
@@ -230,21 +251,24 @@ defmodule Mix.Tasks.Tia do
   defp record_here(map, files, config) do
     total = length(files)
 
-    {map, failed} =
+    {map, failed, taken} =
       recording(config, &start_app/0, fn modules ->
         files
         |> Enum.with_index(1)
-        |> Enum.reduce({{map, []}, @no_stats}, fn {file, index}, {{map, failed}, stats} ->
+        |> Enum.reduce({{map, [], %{}}, @no_stats}, fn {file, index},
+                                                       {{map, failed, taken}, stats} ->
           Mix.shell().info("tia: [#{index}/#{total}] #{file}")
-          {map, failed, stats} = record_file(map, failed, stats, file, modules, config)
+          {map, failed, stats, ms} = record_file(map, failed, stats, file, modules, config)
           if rem(index, @save_every) == 0, do: Tia.Map.write(map, config.map)
-          {{map, failed}, stats}
+          {{map, failed, took(taken, file, ms)}, stats}
         end)
       end)
 
-    Tia.Map.write(map, config.map)
-    summary(files, failed, config, "")
+    {map, failed, taken, ""}
   end
+
+  defp took(taken, _file, nil), do: taken
+  defp took(taken, file, ms), do: Map.put(taken, file, ms)
 
   defp summary(files, failed, config, suffix) do
     Mix.shell().info(
@@ -257,7 +281,8 @@ defmodule Mix.Tasks.Tia do
 
   # The worker side of `--partitions`. It tells the coordinator it is ready,
   # then records each test file that arrives as a line on its standard input
-  # and answers with a `done` line. An empty line or the end of the input
+  # and answers with a `done` line, which carries how long the recording took
+  # when the tests passed. An empty line or the end of the input
   # means there is no more work: it writes its partial map to `out` and
   # leaves. It never raises for failing tests: the coordinator takes every
   # file it handed out that is absent from the partial map as failed.
@@ -277,7 +302,7 @@ defmodule Mix.Tasks.Tia do
         {map, stats}
 
       file ->
-        {map, failed, stats} =
+        {map, _failed, stats, ms} =
           try do
             record_file(map, [], stats, file, modules, config)
           catch
@@ -290,7 +315,7 @@ defmodule Mix.Tasks.Tia do
 
         count = count + 1
         if rem(count, @save_every) == 0, do: Tia.Map.write(map, out)
-        signal("done #{file} #{if failed == [], do: "ok", else: "failed"}")
+        signal(if ms, do: "done ok #{ms} #{file}", else: "done failed - #{file}")
         serve(map, stats, count, modules, config, out)
     end
   end
@@ -335,10 +360,20 @@ defmodule Mix.Tasks.Tia do
 
     try do
       workers = Map.new(1..count, &open_worker(&1, dir, config))
-      state = %{queue: queue, total: length(queue), sent: 0, workers: workers, results: []}
-      {map, failed} = state |> dispatch_loop() |> Enum.reduce({map, []}, &merge_partial/2)
-      Tia.Map.write(map, config.map)
-      summary(queue, failed, config, " (#{count} partitions)")
+
+      {results, taken} =
+        dispatch_loop(%{
+          queue: queue,
+          total: length(queue),
+          sent: 0,
+          workers: workers,
+          results: [],
+          taken: %{}
+        })
+
+      {map, failed} = Enum.reduce(results, {map, []}, &merge_partial/2)
+      # Only what reached the map has a duration worth keeping.
+      {map, failed, Map.take(taken, Map.keys(map["tests"])), " (#{count} partitions)"}
     after
       File.rm_rf!(dir)
     end
@@ -369,18 +404,19 @@ defmodule Mix.Tasks.Tia do
   # the queue needs no lock. A worker gets a test file when it says `ready`
   # and another one each time it says `done`, and an empty line once the
   # queue is empty. Returns, for each worker, the files it was given and the
-  # partial map it left, plus the files nobody was left to take.
-  defp dispatch_loop(%{workers: workers, queue: [], results: results})
+  # partial map it left, plus the files nobody was left to take, and the
+  # durations the workers reported.
+  defp dispatch_loop(%{workers: workers, queue: [], results: results, taken: taken})
        when map_size(workers) == 0,
-       do: results
+       do: {results, taken}
 
-  defp dispatch_loop(%{workers: workers, queue: queue, results: results})
+  defp dispatch_loop(%{workers: workers, queue: queue, results: results, taken: taken})
        when map_size(workers) == 0 do
     Mix.shell().error(
       "tia: every partition exited, #{length(queue)} test files were not recorded"
     )
 
-    [{queue, :error} | results]
+    {[{queue, :error} | results], taken}
   end
 
   defp dispatch_loop(%{workers: workers} = state) do
@@ -409,8 +445,18 @@ defmodule Mix.Tasks.Tia do
 
     case signal do
       "ready" -> hand_out(state, port)
-      "done " <> _file_and_result -> hand_out(state, port)
+      "done " <> result -> state |> finished(result) |> hand_out(port)
       _unknown -> state
+    end
+  end
+
+  # The path comes last because it may have spaces.
+  defp finished(state, result) do
+    with ["ok", text, file] <- String.split(result, " ", parts: 3),
+         {ms, ""} <- Integer.parse(text) do
+      put_in(state.taken[file], ms)
+    else
+      _failed_or_unknown -> state
     end
   end
 
@@ -548,10 +594,10 @@ defmodule Mix.Tasks.Tia do
         sources = Tia.Recorder.sources(executed, config.root)
         names = Enum.map(executed, &Atom.to_string/1)
         ms = System.monotonic_time(:millisecond) - started
-        {Tia.Map.put(map, config, file, sources, names, ms), failed, stats}
+        {Tia.Map.put(map, config, file, sources, names), failed, stats, ms}
 
       %{failures: _} ->
-        {Tia.Map.delete(map, file), [file | failed], stats}
+        {Tia.Map.delete(map, file), [file | failed], stats, nil}
     end
   end
 

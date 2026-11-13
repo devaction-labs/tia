@@ -29,7 +29,9 @@ defmodule Tia.Config do
     * `:cache` - path of the local hash cache, relative to `:root` or
       absolute, default `".tia/cache.bin"`, or `false` to do without it. See
       `Tia.Cache`. `mix tia` opens it; the functions of `Tia.Map` only use a
-      cache that `Tia.Cache.attach/1` opened
+      cache that `Tia.Cache.attach/1` opened. The durations of the recordings
+      are kept in the same directory, in `durations.bin`, and not at all
+      when this is `false`; see `Tia.Durations`
     * `:root` - project root, default `"."`
 
   List keys replace their default.

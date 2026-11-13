@@ -188,28 +188,72 @@ defmodule Tia.MapTest do
            |> Enum.count(&String.contains?(&1, "_test.exs")) == 2
   end
 
-  test "the duration is stored on the same line and is not part of the fingerprint", %{
+  test "write gives the same bytes for the same map, whatever the order it was built in", %{
+    root: root,
+    config: config
+  } do
+    write(root, "lib/c.ex", "defmodule C, do: nil")
+    beam(root, "Elixir.C", 1)
+    sources = ["lib/a.ex", "lib/b.ex", "lib/c.ex"]
+    modules = ["Elixir.A", "Elixir.B", "Elixir.C"]
+
+    forward =
+      config
+      |> Tia.Map.new()
+      |> Tia.Map.put(config, "test/a_test.exs", sources, modules)
+      |> Tia.Map.put(config, "test/b_test.exs", ["lib/b.ex"], ["Elixir.B"])
+
+    backward =
+      config
+      |> Tia.Map.new()
+      |> Tia.Map.put(config, "test/b_test.exs", ["lib/b.ex"], ["Elixir.B"])
+      |> Tia.Map.put(config, "test/a_test.exs", Enum.reverse(sources), Enum.reverse(modules))
+
+    assert forward == backward
+    assert forward["tests"]["test/a_test.exs"]["sources"] == sources
+    assert forward["tests"]["test/a_test.exs"]["modules"] == modules
+
+    # An entry that did not come from put/5, as one of a map merged by hand.
+    shuffled =
+      update_in(forward["tests"]["test/a_test.exs"], fn entry ->
+        %{entry | "sources" => Enum.reverse(sources), "modules" => Enum.reverse(modules)}
+      end)
+
+    bytes =
+      for {map, name} <- [{forward, "1.json"}, {backward, "2.json"}, {shuffled, "3.json"}] do
+        path = Path.join(root, name)
+        assert :ok = Tia.Map.write(map, path)
+        File.read!(path)
+      end
+
+    assert [same, same, same] = bytes
+    assert {:ok, ^forward} = Tia.Map.read(Path.join(root, "3.json"))
+
+    assert [a_line, b_line] = same |> String.split("\n") |> Enum.filter(&(&1 =~ "_test.exs"))
+    assert a_line =~ ~s("test/a_test.exs": {"hash":)
+    assert a_line =~ ~s("modules":["Elixir.A","Elixir.B","Elixir.C"],"sources":["lib/a.ex",)
+    assert b_line =~ ~s("test/b_test.exs")
+  end
+
+  test "a map with the ms of 0.2.0 is read without it and written without it", %{
     root: root,
     map: map,
     config: config
   } do
-    timed = Tia.Map.put(map, config, "test/a_test.exs", ["lib/a.ex"], ["Elixir.A"], 1234)
-
-    assert timed["tests"]["test/a_test.exs"]["ms"] == 1234
-    assert timed["tests"]["test/a_test.exs"]["hash"] == map["tests"]["test/a_test.exs"]["hash"]
-    refute Map.has_key?(map["tests"]["test/a_test.exs"], "ms")
-    assert Tia.Map.durations(timed) == %{"test/a_test.exs" => 1234}
-    assert Tia.Map.durations(map) == %{}
-    assert Tia.Map.plan(timed, config) == {:run, []}
-
     path = Path.join(root, ".tia/map.json")
-    assert :ok = Tia.Map.write(timed, path)
-    assert {:ok, ^timed} = Tia.Map.read(path)
+    assert :ok = Tia.Map.write(map, path)
+    clean = File.read!(path)
 
-    lines = path |> File.read!() |> String.split("\n")
-    assert Enum.count(lines, &String.contains?(&1, "_test.exs")) == 2
-    assert [line] = Enum.filter(lines, &String.contains?(&1, ~s("ms":1234,)))
-    assert line =~ "test/a_test.exs"
+    old = String.replace(clean, ~s("sources":), ~s("ms":1234,"sources":))
+    assert old |> String.split("\n") |> Enum.count(&(&1 =~ ~s("ms":1234,))) == 2
+    File.write!(path, old)
+
+    assert {:ok, ^map} = Tia.Map.read(path)
+    assert Tia.Map.plan(map, config) == {:run, []}
+
+    assert :ok = Tia.Map.write(map, path)
+    assert File.read!(path) == clean
+    refute clean =~ ~s("ms")
   end
 
   test "with a cache the plan is the same and follows the disk", %{root: root, map: map} do

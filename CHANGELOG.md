@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+- The map no longer holds `ms`, the time each recording took. It changed on every run, so `.tia/map.json` showed up as modified in git, and conflicted between branches, when no selection had changed. The map now changes only when the hash, the modules or the sources of an entry change, or the globals: `mix tia --all` on the same code writes the same bytes.
+- The durations moved to `.tia/durations.bin` (`Tia.Durations`), a local file next to the hash cache, written through a temporary file and a rename. `--partitions` still hands out the slowest test files first, by the durations of the last recordings on the machine. A file that is missing or damaged counts as empty: the queue then follows the order of the names. With `cache: false` no durations are read or written. Add `/.tia/durations.bin` to `.gitignore`.
+- The map stays at version 4. The `ms` of a map recorded by 0.2.0 is ignored when it is read and leaves an entry when its test file is recorded again; `mix tia --all` removes all of them.
+- `Tia.Map.write/2` and `Tia.Map.put/5` sort the modules and the sources of an entry, so the bytes of the map do not depend on the order they were given in.
+- Breaking for callers of the API: `Tia.Map.put/6` and `Tia.Map.durations/1`, added in 0.2.0, are removed. `mix tia` is not affected.
+
 ## 0.2.0
 
 - Each test file now records the modules it executed, and its fingerprint includes a digest of their compiled `.beam` files. A change to a macro, a case template or a value inlined at compile time selects only the test files that executed a module compiled with it.

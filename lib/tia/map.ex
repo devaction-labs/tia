@@ -16,9 +16,10 @@ defmodule Tia.Map do
   directory, never from the loaded module, because recording replaces the
   loaded code with an instrumented copy.
 
-  An entry may also carry `ms`, the wall-clock time recording the test file
-  took. It is not part of the fingerprint: `mix tia --partitions` reads it to
-  hand out the slowest test files first.
+  The map is meant to be committed, so it holds nothing that changes from one
+  run to the next: recording the same code twice writes the same bytes. How
+  long a test file took to record is kept in `Tia.Durations`, out of version
+  control.
 
   Hashing goes through `Tia.Cache` when the config carries an open cache, see
   `Tia.Cache.attach/1`.
@@ -40,18 +41,25 @@ defmodule Tia.Map do
   def new(%Config{} = config),
     do: %{"version" => @version, "globals" => globals(config), "tests" => %{}}
 
-  @doc "Reads a map, or `:error` when it is missing, unreadable or of another version."
+  @doc """
+  Reads a map, or `:error` when it is missing, unreadable or of another
+  version. The `ms` that Tia 0.2.0 stored in each entry is left out.
+  """
   @spec read(Path.t()) :: {:ok, t()} | :error
   def read(path) do
     with {:ok, body} <- File.read(path),
          {:ok, %{"version" => @version} = map} <- JSON.decode(body) do
-      {:ok, map}
+      {:ok, drop_durations(map)}
     else
       _ -> :error
     end
   end
 
-  @doc "Writes the map with one test file per line, so concurrent edits merge cleanly."
+  @doc """
+  Writes the map with one test file per line, so concurrent edits merge
+  cleanly. The same map always gives the same bytes: the test files, and the
+  modules and the sources of each one, are written in order.
+  """
   @spec write(t(), Path.t()) :: :ok
   def write(%{"tests" => tests} = map, path) do
     File.mkdir_p!(Path.dirname(path))
@@ -71,23 +79,15 @@ defmodule Tia.Map do
   @doc """
   Stores the sources and the modules a test file executed, fingerprinted
   against the disk. Modules are given by name, as in `"Elixir.MyApp.User"`.
-  `ms` is the time the recording took, in milliseconds; without it the entry
-  has no duration.
+  Both lists are stored in order.
   """
-  @spec put(t(), Config.t(), String.t(), [String.t()], [String.t()], non_neg_integer() | nil) ::
-          t()
-  def put(%{"tests" => tests} = map, %Config{} = config, test_file, sources, modules, ms \\ nil) do
+  @spec put(t(), Config.t(), String.t(), [String.t()], [String.t()]) :: t()
+  def put(%{"tests" => tests} = map, %Config{} = config, test_file, sources, modules) do
     files = [test_file | sources]
     hash = fingerprint(files, hashes(config, files), modules, beams(config, modules))
-    entry = %{"hash" => hash, "modules" => modules, "sources" => sources}
-    entry = if is_integer(ms), do: Map.put(entry, "ms", ms), else: entry
+    entry = %{"hash" => hash, "modules" => Enum.sort(modules), "sources" => Enum.sort(sources)}
     %{map | "tests" => Map.put(tests, test_file, entry)}
   end
-
-  @doc "The recorded duration of each test file that has one, in milliseconds."
-  @spec durations(t()) :: %{String.t() => non_neg_integer()}
-  def durations(%{"tests" => tests}),
-    do: for({file, %{"ms" => ms}} <- tests, is_integer(ms), into: %{}, do: {file, ms})
 
   @doc "Forgets a test file, which makes it stale until it is recorded again."
   @spec delete(t(), String.t()) :: t()
@@ -157,13 +157,23 @@ defmodule Tia.Map do
     for file <- disk, stale_entry?(Map.get(tests, file), file, hashes, beams), do: file
   end
 
-  defp encode_entry(%{"hash" => hash, "modules" => modules, "sources" => sources} = entry) do
-    "{\"hash\":#{JSON.encode!(hash)},\"modules\":#{JSON.encode!(modules)}," <>
-      encode_ms(entry) <> "\"sources\":#{JSON.encode!(sources)}}"
+  # Only these three keys reach the file, whatever else the entry carries.
+  defp encode_entry(%{"hash" => hash, "modules" => modules, "sources" => sources}) do
+    "{\"hash\":#{JSON.encode!(hash)},\"modules\":#{JSON.encode!(Enum.sort(modules))}," <>
+      "\"sources\":#{JSON.encode!(Enum.sort(sources))}}"
   end
 
-  defp encode_ms(%{"ms" => ms}) when is_integer(ms), do: "\"ms\":#{ms},"
-  defp encode_ms(_entry), do: ""
+  defp drop_durations(%{"tests" => tests} = map) when is_map(tests) do
+    tests =
+      Map.new(tests, fn
+        {file, entry} when is_map(entry) -> {file, Map.delete(entry, "ms")}
+        other -> other
+      end)
+
+    %{map | "tests" => tests}
+  end
+
+  defp drop_durations(map), do: map
 
   defp stale_entry?(nil, _file, _hashes, _beams), do: true
 

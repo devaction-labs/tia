@@ -67,22 +67,34 @@ Every mode compiles the project first: the selection reads the compiled
 
 ## What to commit
 
-Commit the map, `.tia/map.json`, so that CI and your colleagues start from it.
-Keep the local hash cache out of version control:
+Commit the map, `.tia/map.json`: CI runs `mix tia --check` with it, and your
+colleagues start from it. Everything else in `.tia/` belongs to one checkout
+and stays out of version control:
 
 ```gitignore
 # .gitignore
 /.tia/cache.bin
+/.tia/durations.bin
 /.tia/partitions/
 ```
 
-`.tia/partitions/` only exists while `--partitions` runs. The cache is
-described in [The hash cache](#the-hash-cache).
+| Path | In git | What it is |
+| --- | --- | --- |
+| `.tia/map.json` | yes | The map: what each test file executed, and its fingerprint |
+| `.tia/cache.bin` | no | [The hash cache](#the-hash-cache) |
+| `.tia/durations.bin` | no | How long each test file took to record, for [Partitions](#partitions) |
+| `.tia/partitions/` | no | Only exists while `--partitions` runs |
 
-Each line of the map holds one test file: its fingerprint, the modules and
-sources it executed, and `ms`, the time its recording took. `ms` is not part
-of the fingerprint. It changes every time the test file is recorded again,
-and only then.
+Each line of the map holds one test file: its fingerprint and the modules and
+sources it executed, in order. Nothing in it depends on the run, so the map
+changes only when a selection does: recording the same code again, with
+`mix tia --all`, writes the same bytes, and `mix tia` with nothing stale does
+not write it at all. A diff of the map shows the test files whose
+dependencies changed, one line each.
+
+A map recorded by Tia 0.2.0 has an `ms` in each line. It is ignored, and
+leaves a line when its test file is recorded again; `mix tia --all` removes
+all of them at once.
 
 ## What forces the whole suite
 
@@ -215,15 +227,21 @@ tia: [cache: false]
 ```
 
 `:cache` also takes another path, relative to the project root or absolute.
+The durations of the recordings, `durations.bin`, are kept in the same
+directory as the cache, and are not kept at all with `cache: false`.
 
 ## Partitions
 
 `--partitions N` starts `N` processes and one queue. A process asks for the
 next test file when it finishes the one it has, so a slow file holds back only
-the process that runs it. The queue starts with the test files the map has no
-duration for, followed by the others from the slowest to the fastest, so the
+the process that runs it. The queue starts with the test files that have no
+known duration, followed by the others from the slowest to the fastest, so the
 long ones go first and the partitions finish close to each other. The
-progress counts over the whole run:
+durations are the ones of the last recordings on your machine, kept in
+`.tia/durations.bin`, next to the hash cache and out of version control.
+Without that file, as on a fresh checkout, the queue follows the order of the
+names. With `cache: false` no durations are kept. The progress counts over the
+whole run:
 
 ```console
 [2] tia: [12/749] test/my_app/accounts_test.exs

@@ -428,12 +428,57 @@ defmodule Mix.Tasks.TiaTest do
     assert Enum.all?(others, fn {partition, _index, _file} -> partition != slow end)
 
     # The slow file took at least as long as all the others it waited for.
-    recorded = tests(root)
-    slow_ms = recorded["test/aaa_slow_test.exs"]["ms"]
-    assert Enum.all?(quick, &(recorded["test/#{&1}_test.exs"]["ms"] <= slow_ms))
+    taken = durations(root)
+    slow_ms = taken["test/aaa_slow_test.exs"]
+    assert Enum.all?(quick, &(taken["test/#{&1}_test.exs"] <= slow_ms))
   end
 
-  test "records how long each test file took and hands out the slowest first", %{root: root} do
+  test "recording the same code again leaves the map byte for byte the same", %{root: root} do
+    map_path = Path.join(root, ".tia/map.json")
+
+    assert {output, 0} = mix(root, ["tia", "--all"])
+    assert output =~ "recorded 3 of 3"
+    first = File.read!(map_path)
+    refute first =~ ~s("ms")
+
+    assert {output, 0} = mix(root, ["tia", "--all"])
+    assert output =~ "recorded 3 of 3"
+    assert File.read!(map_path) == first
+
+    assert {output, 0} = mix(root, ["tia", "--all", "--partitions", "2"])
+    assert output =~ "recorded 3 of 3"
+    assert File.read!(map_path) == first
+
+    # A current map is not written at all.
+    File.touch!(map_path, System.os_time(:second) - 100)
+    written = File.stat!(map_path, time: :posix).mtime
+    assert {output, 0} = mix(root, ["tia"])
+    assert output =~ "map is current"
+    assert File.stat!(map_path, time: :posix).mtime == written
+    assert File.read!(map_path) == first
+
+    # The `ms` a map of 0.2.0 carries is ignored, and gone with the next recording.
+    File.write!(map_path, String.replace(first, ~s("sources":), ~s("ms":1234,"sources":)))
+    assert File.read!(map_path) =~ ~s("ms":1234,)
+    assert {output, 0} = mix(root, ["tia"])
+    assert output =~ "map is current"
+    assert {output, 0} = mix(root, ["tia", "--check", "--dry-run", "--base", "HEAD"], git: true)
+    assert output =~ "no test file is affected"
+
+    write(root, "lib/alpha.ex", "defmodule Alpha, do: def(value, do: 3 - 2)")
+    assert {output, 0} = mix(root, ["tia"])
+    assert output =~ "recorded 1 of 1"
+    refute File.read!(map_path) =~ ~s("ms")
+
+    # Only the line of the test file recorded again changed.
+    changed = String.split(File.read!(map_path), "\n") -- String.split(first, "\n")
+    assert [line] = changed
+    assert line =~ "test/alpha_test.exs"
+  end
+
+  test "keeps how long each test file took out of the map and hands out the slowest first", %{
+    root: root
+  } do
     write(root, "test/zzz_sleepy_test.exs", """
     defmodule ZzzSleepyTest do
       use ExUnit.Case
@@ -441,30 +486,42 @@ defmodule Mix.Tasks.TiaTest do
     end
     """)
 
-    assert {_, 0} = mix(root, ["tia"])
-    recorded = tests(root)
-    assert Enum.all?(recorded, fn {_file, entry} -> is_integer(entry["ms"]) end)
-    assert recorded["test/zzz_sleepy_test.exs"]["ms"] >= 400
-    assert recorded["test/alpha_test.exs"]["ms"] < 400
-
     map_path = Path.join(root, ".tia/map.json")
-    lines = map_path |> File.read!() |> String.split("\n")
-    assert Enum.count(lines, &(&1 =~ ~s("ms":))) == 4
-    assert Enum.count(lines, &(&1 =~ "_test.exs")) == 4
+    durations_path = Path.join(root, ".tia/durations.bin")
+
+    assert {_, 0} = mix(root, ["tia"])
+    taken = durations(root)
+    assert Map.keys(taken) == Map.keys(tests(root))
+    assert map_size(taken) == 4
+    assert Enum.all?(taken, fn {_file, ms} -> is_integer(ms) end)
+    assert taken["test/zzz_sleepy_test.exs"] >= 400
+    assert taken["test/alpha_test.exs"] < 400
+    refute File.read!(map_path) =~ ~s("ms")
+    assert Path.wildcard(Path.join(root, ".tia/*.tmp")) == []
 
     # Last by name, first by duration. `--all` empties the map but keeps the order.
     assert {output, 0} = mix(root, ["tia", "--all", "--partitions", "2"])
     assert [{_, 1, "test/zzz_sleepy_test.exs"} | _] = handed_out(output)
-    assert tests(root)["test/zzz_sleepy_test.exs"]["ms"] >= 400
+    assert durations(root)["test/zzz_sleepy_test.exs"] >= 400
+    assert map_size(durations(root)) == 4
 
-    # A map without durations is still current, and keeps the order of the names.
-    File.write!(map_path, Regex.replace(~r/"ms":\d+,/, File.read!(map_path), ""))
-    refute File.read!(map_path) =~ ~s("ms")
+    # Without the durations the map is still current, and the queue keeps the
+    # order of the names. The partitions write them again.
+    File.rm!(durations_path)
     assert {output, 0} = mix(root, ["tia", "--dry-run"])
     assert output =~ "map is current"
+    refute File.exists?(durations_path)
 
     assert {output, 0} = mix(root, ["tia", "--all", "--partitions", "2"])
     assert [{_, 1, "test/alpha_test.exs"} | _] = handed_out(output)
+    assert durations(root)["test/zzz_sleepy_test.exs"] >= 400
+
+    # Damaged durations count as none, and are replaced.
+    File.write!(durations_path, "not the durations")
+    assert {output, 0} = mix(root, ["tia", "--all", "--partitions", "2"])
+    assert output =~ "recorded 4 of 4"
+    assert [{_, 1, "test/alpha_test.exs"} | _] = handed_out(output)
+    assert durations(root)["test/zzz_sleepy_test.exs"] >= 400
 
     # A test file with no duration goes before the ones that have one.
     write(root, "test/new_test.exs", test_module("NewTest", "Beta.value() == 2"))
@@ -484,6 +541,17 @@ defmodule Mix.Tasks.TiaTest do
              {_, 2, "test/zzz_sleepy_test.exs"},
              {_, 3, "test/alpha_test.exs"}
            ] = handed_out(output)
+
+    assert durations(root)["test/zzz_sleepy_test.exs"] >= 401
+    assert map_size(durations(root)) == 5
+
+    # A failing test file keeps the duration it had, a deleted one loses it.
+    write(root, "test/new_test.exs", test_module("NewTest", "Beta.value() == :nope"))
+    File.rm!(Path.join(root, "test/zzz_sleepy_test.exs"))
+    before = durations(root)
+    assert {_, status} = mix(root, ["tia"])
+    assert status != 0
+    assert durations(root) == Map.delete(before, "test/zzz_sleepy_test.exs")
   end
 
   test "a partition that dies loses only its own test files", %{root: root} do
@@ -579,12 +647,22 @@ defmodule Mix.Tasks.TiaTest do
     assert {output, 0} = mix(root, ["tia"])
     assert output =~ "recorded 1 of 1"
 
+    # Without a cache nothing local is written: no hashes and no durations.
+    assert File.ls!(Path.join(root, ".tia")) |> Enum.sort() ==
+             ["cache.bin", "durations.bin", "map.json"]
+
     File.rm!(cache)
+    File.rm!(Path.join(root, ".tia/durations.bin"))
     configure(root, "cache: false")
     Process.sleep(2100)
     assert {output, 0} = mix(root, ["tia", "--all"])
     assert output =~ "recorded 3 of 3"
-    refute File.exists?(cache)
+    assert File.ls!(Path.join(root, ".tia")) == ["map.json"]
+
+    assert {output, 0} = mix(root, ["tia", "--all", "--partitions", "2"])
+    assert output =~ "recorded 3 of 3"
+    assert [{_, 1, "test/alpha_test.exs"} | _] = handed_out(output)
+    assert File.ls!(Path.join(root, ".tia")) == ["map.json"]
   end
 
   test "outside the test environment it refuses with the fix", %{root: root} do
@@ -658,6 +736,14 @@ defmodule Mix.Tasks.TiaTest do
   end
 
   defp git!(root, args), do: {_, 0} = System.cmd("git", args, cd: root, stderr_to_stdout: true)
+
+  # The durations kept next to the hash cache, by test file.
+  defp durations(root) do
+    assert {:tia_durations, 1, durations} =
+             root |> Path.join(".tia/durations.bin") |> File.read!() |> :erlang.binary_to_term()
+
+    durations
+  end
 
   defp tests(root) do
     {:ok, map} = Tia.Map.read(Path.join(root, ".tia/map.json"))
