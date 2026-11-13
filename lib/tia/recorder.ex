@@ -1,6 +1,6 @@
 defmodule Tia.Recorder do
   @moduledoc """
-  Reads which source files have run since the last `reset/1`.
+  Reads which modules and source files have run since the last `reset/1`.
 
   It uses the JIT's native function counters (`:code.set_coverage_mode/1`,
   OTP 27+). Unlike `:cover` they need no recompilation, and reading or zeroing
@@ -30,21 +30,47 @@ defmodule Tia.Recorder do
     modules
   end
 
+  @doc """
+  Drops the modules matched by the `:ignore_modules` option of `Tia.Config`:
+  an atom matches that module, a string matches every module whose name
+  starts with it.
+  """
+  @spec reject_ignored([module()], [module() | String.t()]) :: [module()]
+  def reject_ignored(modules, []), do: modules
+
+  def reject_ignored(modules, ignored) do
+    Enum.reject(modules, fn module ->
+      name = inspect(module)
+
+      Enum.any?(ignored, fn
+        pattern when is_atom(pattern) -> pattern == module
+        prefix when is_binary(prefix) -> String.starts_with?(name, prefix)
+      end)
+    end)
+  end
+
   @doc "Zeroes the counters of the given modules."
   @spec reset([module()]) :: :ok
   def reset(modules), do: Enum.each(modules, &:code.reset_coverage/1)
 
   @doc """
-  Returns the sorted files behind the modules that executed since `reset/1`:
-  each module's source plus its `@external_resource` files, which is how
-  templates and other compiled-in data end up in the map.
+  Returns the sorted modules, out of the given ones, that executed since
+  `reset/1`. Macros count: a case template whose `__using__/1` expanded while
+  a test file was being compiled is executed.
   """
-  @spec executed_sources([module()], Path.t()) :: [String.t()]
-  def executed_sources(modules, root) do
+  @spec executed_modules([module()]) :: [module()]
+  def executed_modules(modules), do: modules |> Enum.filter(&executed?/1) |> Enum.sort()
+
+  @doc """
+  Returns the sorted files behind the given modules: each module's source plus
+  its `@external_resource` files, which is how templates and other compiled-in
+  data end up in the map.
+  """
+  @spec sources([module()], Path.t()) :: [String.t()]
+  def sources(modules, root) do
     root = Path.expand(root)
 
     modules
-    |> Enum.filter(&executed?/1)
     |> Enum.flat_map(&files_of/1)
     |> Enum.map(&relative(&1, root))
     |> Enum.filter(&(Path.type(&1) == :relative))
