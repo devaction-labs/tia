@@ -249,4 +249,52 @@ defmodule Tia.BeamTest do
     assert Tia.Beam.digest(Path.join(dir, "nope.beam")) == :error
     assert Tia.Beam.digest(write(dir, "broken", "not a beam")) == :error
   end
+
+  # Rewrites `:impls` in the debug_info chunk of a compiled module, as the
+  # dependency that defines a behaviour leaves it there.
+  defp with_impls(dir, name, impls) do
+    source = """
+    defmodule Tia.BeamTest.Worker do
+      def perform(arg), do: arg
+    end
+    """
+
+    path = compile(dir, name, source)
+    charlist = String.to_charlist(path)
+
+    {:ok, {_module, [debug_info: {:debug_info_v1, backend, {:elixir_v1, info, specs}}]}} =
+      :beam_lib.chunks(charlist, [:debug_info])
+
+    debug_info = {:debug_info_v1, backend, {:elixir_v1, Map.put(info, :impls, impls), specs}}
+    {:ok, _module, all} = :beam_lib.all_chunks(charlist)
+    all = List.keyreplace(all, ~c"Dbgi", 0, {~c"Dbgi", :erlang.term_to_binary(debug_info)})
+    {:ok, binary} = :beam_lib.build_module(all)
+    write(dir, name, binary)
+  end
+
+  defp impl(file, name \\ :perform),
+    do: {{name, 1}, Oban.Worker, 0, :def, 10, file, Oban.Worker}
+
+  test "entries of :impls that differ only by file path have the same digest", %{tmp_dir: dir} do
+    first = with_impls(dir, "first", [impl("/ci/a/deps/oban/lib/oban/worker.ex")])
+    second = with_impls(dir, "second", [impl("/ci/b/deps/oban/lib/oban/worker.ex")])
+
+    assert {:ok, _digest} = Tia.Beam.digest(first, "/ci/b/work")
+    assert Tia.Beam.digest(first, "/ci/b/work") == Tia.Beam.digest(second, "/ci/b/work")
+  end
+
+  test "entries of :impls that differ by function or behaviour have another digest",
+       %{tmp_dir: dir} do
+    path = "/ci/a/deps/oban/lib/oban/worker.ex"
+    base = with_impls(dir, "base", [impl(path)])
+    function = with_impls(dir, "function", [impl(path, :new)])
+
+    behaviour =
+      with_impls(dir, "behaviour", [
+        {{:perform, 1}, Other.Worker, 0, :def, 10, path, Other.Worker}
+      ])
+
+    assert Tia.Beam.digest(base) != Tia.Beam.digest(function)
+    assert Tia.Beam.digest(base) != Tia.Beam.digest(behaviour)
+  end
 end

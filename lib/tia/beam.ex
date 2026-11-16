@@ -27,7 +27,10 @@ defmodule Tia.Beam do
     * the arguments of a call, the expressions of a block, the clauses of
       `fn`, `case` and friends, the elements of a tuple and the segments of a
       binary keep their order;
-    * the specs and the file paths of the chunk are left out;
+    * the specs and the file paths of the chunk are left out, including the path
+      that each entry of `:impls` keeps of the dependency that defines the
+      behaviour (`Oban.Worker`, Commanded handlers): it is where that
+      dependency was compiled, not code of the module;
     * the definitions of `__mix_recompile__?/0` and `__phoenix_recompile__?/0`
       are left out: they are hooks that tell Mix, or the old `:phoenix`
       compiler, when to recompile the module, not code a test observes.
@@ -168,9 +171,19 @@ defmodule Tia.Beam do
       |> Enum.map(&definition/1)
       |> Enum.sort()
 
-    rest = info |> Map.drop(@unstable) |> canon()
+    rest = info |> Map.drop(@unstable) |> Map.update(:impls, [], &impls/1) |> canon()
     :erlang.term_to_binary({module, rest, definitions}, [:deterministic])
   end
+
+  # `{{name, arity}, behaviour, callback_arity, kind, line, file, behaviour}`: the
+  # file is the absolute path of the source of the dependency, outside the root.
+  defp impls(impls) when is_list(impls), do: Enum.map(impls, &impl/1)
+  defp impls(other), do: other
+
+  defp impl({name_arity, behaviour, arity, kind, line, file, module}) when is_binary(file),
+    do: {name_arity, behaviour, arity, kind, line, module}
+
+  defp impl(other), do: other
 
   defp recompile_hook?({name_arity, _kind, _meta, _clauses}), do: name_arity in @recompile_hooks
   defp recompile_hook?(_other), do: false

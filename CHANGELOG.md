@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2
+
+- Fix: the digest of a module no longer depends on the paths in `:impls` of its `debug_info`. Modules that `use Oban.Worker` or a Commanded event handler keep there the absolute path of the dependency source as it was when the dependency was compiled, so a `_build` cache that came from another directory (CI runners with different work directories) changed the digest of every such module and selected far more test files than needed. The path is dropped; the behaviour, function and kind stay.
+- The map stays at version 4: the stored hashes of modules with `:impls` change, so their test files are recorded again, but a 0.2.1 map is read correctly.
+
 ## 0.2.1
 
 - The map no longer holds `ms`, the time each recording took. It changed on every run, so `.tia/map.json` showed up as modified in git, and conflicted between branches, when no selection had changed. The map now changes only when the hash, the modules or the sources of an entry change, or the globals: `mix tia --all` on the same code writes the same bytes.
